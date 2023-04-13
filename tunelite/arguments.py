@@ -23,7 +23,11 @@ class DataArguments:
 
 @dataclass
 class TuneLiteArguments(Seq2SeqTrainingArguments):
-    tag: str = field(default="debug", metadata={"help": "Tag for the experiment."})
+    tag: str = field(default=None, metadata={"help": "Tag for the experiment."})
+
+    clip_grad_value: float = field(default=None, metadata={"help": "Maximum gradient value (for gradient clipping)."})  # recommend 1.0
+    clip_loss_value: float = field(default=None, metadata={"help": "Maximum loss value (for token loss clipping)."})  # recommend 5.0
+    warmup: float = field(default=0.0, metadata={"help": "The number of warmup steps (int) or the warmup ratio (float)."})
 
     max_new_tokens: int = field(default=100, metadata={"help": "The maximum numbers of tokens to generate, ignoring the number of tokens in the prompt."})
     temperature: float = field(default=1.0, metadata={"help": "The value used to modulate the next token probabilities."})

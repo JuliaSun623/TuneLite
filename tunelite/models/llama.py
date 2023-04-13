@@ -7,11 +7,10 @@
 # https://github.com/nebuly-ai/nebullvm/tree/main/apps/accelerate/chatllama/chatllama
 import json
 import math
-import random
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, List, Union, Optional
+from typing import Tuple
 
 import torch
 import torch.distributed
@@ -24,8 +23,9 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
     ColumnParallelLinear,
 )
-from transformers import AutoTokenizer
-from sentencepiece import SentencePieceProcessor
+
+from .llama_tokenizer import HFLikeTokenizer, Tokenizer
+from tunelite.log import print
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -36,162 +36,6 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
-
-class Tokenizer:
-    def __init__(self, model_path: str):
-        # reload tokenizer
-        assert os.path.isfile(model_path), model_path
-        self.sp_model = SentencePieceProcessor(model_file=model_path)
-
-        # BOS / EOS token IDs
-        self.n_words: int = self.sp_model.vocab_size()
-        self.bos_id: int = self.sp_model.bos_id()
-        self.eos_id: int = self.sp_model.eos_id()
-        self.pad_id: int = self.sp_model.pad_id()
-        assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
-
-    def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
-        assert type(s) is str
-        t = self.sp_model.encode(s)
-        if bos:
-            t = [self.bos_id] + t
-        if eos:
-            t = t + [self.eos_id]
-        return t
-
-    def decode(self, t: List[int]) -> str:
-        if self.bos_id in t:
-            t = t[t.index(self.bos_id):]
-        if self.eos_id in t:
-            t = t[:t.index(self.eos_id)+1]
-        return self.sp_model.decode(t)
-
-    def batch_decode(self, batch_t: List[int]) -> str:
-        for t in batch_t:
-            if self.bos_id in t:
-                t = t[t.index(self.bos_id):]
-            if self.eos_id in t:
-                t = t[:t.index(self.eos_id) + 1]
-        return self.sp_model.decode(batch_t)
-
-
-class MyTokenizer:
-    """Masked tokenizer of hugging face to be similar to the one of meta,
-    just used for testing purposes.
-    """
-
-    def __init__(self, model_path: Optional[str] = None):
-
-        if model_path is None:
-            self.sp_model = AutoTokenizer.from_pretrained("gpt2")
-        else:
-            self.sp_model = AutoTokenizer.from_pretrained(model_path)
-
-        self.n_words = self.sp_model.vocab_size
-        self.bos_id = self.sp_model.bos_token_id
-        self.eos_id = self.sp_model.eos_token_id
-        self.pad_id = self.sp_model.eos_token_id
-
-    def encode(
-        self,
-        s: str,
-        bos: bool = True,
-        eos: bool = True,
-        truncation: bool = True,
-    ) -> List[int]:
-        output = self.sp_model.encode(s, truncation=truncation)
-        t = list(output)
-        if bos:
-            t = [self.bos_id] + t
-        if eos:
-            t = t + [self.eos_id]
-        return t
-
-    def decode(self, t: List[int]) -> str:
-        #input = torch.as_tensor(t)
-        input = t.tolist()
-        print(input)
-        output = self.sp_model.decode(input)
-        return output
-
-
-class HFLikeTokenizer:
-    def __init__(self, tokenizer: Tokenizer):
-        self.tokenizer = tokenizer
-
-        # assign attributes from real tokenizer to masked one
-        self.pad_id = self.tokenizer.pad_id
-        self.eos_id = self.tokenizer.eos_id
-        self.bos_id = self.tokenizer.bos_id
-
-        # mask attribute to be similar to hugging face
-        self.eos_token_id = self.tokenizer.eos_id
-        self.pad_token_id = self.tokenizer.pad_id
-
-        # to match hugging face attribute
-        self.pad_token_id = self.pad_id
-
-    def create_sequence_mask(self, tokens: torch.Tensor) -> torch.Tensor:
-        mask = torch.where(
-            tokens == self.tokenizer.pad_id,
-            torch.zeros_like(tokens),
-            torch.ones_like(tokens),
-        )
-        mask = torch.where(
-            tokens == self.tokenizer.bos_id, torch.zeros_like(tokens), mask
-        )
-        mask = torch.where(
-            tokens == self.tokenizer.eos_id, torch.zeros_like(tokens), mask
-        )
-        return mask
-
-    def __call__(self, texts: Union[List[str], str], *args, **kwargs):
-        if isinstance(texts, str):
-            text = self.tokenizer.encode(texts, bos=True, eos=True)
-            tokens = torch.tensor(text).long()
-            mask = torch.ones_like(tokens)
-        else:
-            texts = [
-                self.tokenizer.encode(text, bos=True, eos=True)
-                for text in texts
-            ]
-            max_len = max(len(text) for text in texts)
-            tokens = torch.full(
-                (len(texts), max_len), self.tokenizer.pad_id
-            ).long()
-            for i, text in enumerate(texts):
-                tokens[i, -len(text) :] = torch.tensor(  # noqa E203
-                    text
-                ).long()
-
-            # TODO: decide how eos and bos should be handled - i need to mask
-            # them? or not?
-            mask = self.create_sequence_mask(tokens)
-            for i in range(tokens.shape[0]):
-                current_tokens = tokens[i, mask[i] == 1]
-                tokens[
-                    i, -len(current_tokens) - 1 : -1  # noqa E203
-                ] = current_tokens
-            mask = self.create_sequence_mask(tokens)
-
-            # convert `pad_id` from -1 to 0, otherwise embedding will cause out
-            # of bounds.
-            tokens = torch.where(
-                tokens == self.tokenizer.pad_id,
-                torch.zeros_like(tokens),
-                tokens,
-            )
-        output = {
-            "input_ids": tokens,
-            "attention_mask": mask,
-        }
-        return output
-
-    def decode(self, tokens):
-        return self.tokenizer.decode(tokens)
-
-    def batch_decode(self, tokens):
-        return self.tokenizer.batch_decode(tokens)
 
 
 @dataclass
@@ -345,10 +189,8 @@ class Attention(nn.Module):
         x: torch.Tensor,
         kv_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
-        cache_k: Optional[torch.Tensor] = None,
-        cache_v: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        start_pos = 0  # Temporary
+        start_pos: int
+    ) -> torch.Tensor:
 
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -359,21 +201,16 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # Modified code to allow training, caching is not good for training
-        if (cache_k is None and cache_v is not None) or (
-            cache_k is not None and cache_v is None
-        ):
-            raise ValueError("cache_k is None while cache_v is not None")
-        if cache_k is None:
+        if self.training:
             keys = xk
             values = xv
         else:
-            cache_k.to(xk.device)
-            cache_v.to(xv.device)
-            cache_k[:bsz, start_pos : start_pos + seqlen] = xk  # noqa E203
-            cache_v[:bsz, start_pos : start_pos + seqlen] = xv  # noqa E203
-            keys = self.cache_k[:bsz, : start_pos + seqlen]  # noqa E203
-            values = self.cache_v[:bsz, : start_pos + seqlen]  # noqa E203
+            self.cache_k.to(xk.device)
+            self.cache_v.to(xv.device)
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv 
+            keys = self.cache_k[:bsz, : start_pos + seqlen]  
+            values = self.cache_v[:bsz, : start_pos + seqlen]  
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
@@ -386,10 +223,7 @@ class Attention(nn.Module):
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        if cache_k is None:
-            return self.wo(output), None, None
-        else:
-            return self.wo(output), self.cache_k, self.cache_v
+        return self.wo(output)
 
 
 class FeedForward(nn.Module):
@@ -466,9 +300,8 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
-        cache_k: Optional[torch.Tensor] = None,
-        cache_v: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        start_pos: int
+    ) -> torch.Tensor:
         # modified from orignal code to enable external cache
         attention_mask = attention_mask[:, None, :, :]
         if self.tensor_parallel:
@@ -480,12 +313,12 @@ class TransformerBlock(nn.Module):
             )
         else:
             attention_mask = attention_mask.expand(-1, self.n_heads, -1, -1)
-        attn, cache_k, cache_v = self.attention.forward(
-            self.attention_norm(x), attention_mask, freqs_cis, cache_k, cache_v
+        attn = self.attention.forward(
+            self.attention_norm(x), attention_mask, freqs_cis, start_pos
         )
         h = x + attn
         out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out, cache_k, cache_v
+        return out
 
 
 class Transformer(nn.Module):
@@ -509,14 +342,6 @@ class Transformer(nn.Module):
             self.n_local_heads = params.n_heads
 
         self.head_dim = params.dim // params.n_heads
-        dim = (
-            params.max_batch_size,
-            params.max_seq_len,
-            self.n_local_heads,
-            self.head_dim,
-        )
-        self.cache_k = [torch.zeros(dim) for _ in range(self.n_layers)]
-        self.cache_v = [torch.zeros(dim) for _ in range(self.n_layers)]
 
         if params.tensor_parallel:
             self.tok_embeddings = ParallelEmbedding(
@@ -544,7 +369,6 @@ class Transformer(nn.Module):
         else:
             self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        # TODO: How too modify this for training?
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
@@ -555,19 +379,16 @@ class Transformer(nn.Module):
         self, tokens: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
         attention_mask = attention_mask.detach()
-        logits = self._forward(tokens, attention_mask)
+        logits = self._forward(tokens, attention_mask, 0)
         return logits
 
     def _forward(
-        self, tokens: torch.Tensor, attention_mask: torch.Tensor
+        self, tokens: torch.Tensor, attention_mask: torch.Tensor, start_pos: int
     ) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
-        # TEMPORARY FIX, need to understand how to manage the positioning
-        # embedding and the batch size with the current padding and masking.
-        start_pos = 1
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]  # noqa E203
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # mask has size (bsz, seqlen). It should be transformed in
         # (bsz, seqlen, seqlen)
         # if the mask is a boolean tensor, convert it to int
@@ -591,20 +412,13 @@ class Transformer(nn.Module):
             return custom_forward
 
         for i, layer in enumerate(self.layers):
-            if not self.training:
-                cache_k = self.cache_k[i]
-                cache_v = self.cache_v[i]
-                h, cache_k, cache_v = layer(
-                    h, kv_mask, freqs_cis, cache_k, cache_v
+            if not self.training or not self.gradient_checkpoint:
+                h = layer(
+                    h, kv_mask, freqs_cis, start_pos
                 )
             else:
                 if self.gradient_checkpoint:
-                    h, _, _ = torch.utils.checkpoint.checkpoint(create_custom_forward(layer), h, kv_mask, freqs_cis)
-                else:
-                    h, _, _ = layer(h, kv_mask, freqs_cis)
-            if not self.training:
-                self.cache_k[i] = cache_k.detach()
-                self.cache_v[i] = cache_v.detach()
+                    h = torch.utils.checkpoint.checkpoint(create_custom_forward(layer), h, kv_mask, freqs_cis, start_pos)
 
         h = self.norm(h)
         output = self.output(h)
@@ -621,8 +435,11 @@ class Transformer(nn.Module):
         no_repeat_ngram_size=None,
     ):
         generated_tokens = []
-        for cur_pos in range(max_new_tokens):
-            logits = self._forward(input_ids, attention_mask)[:, -1, :]
+        pre_pos = 0
+        start_pos = input_ids.shape[1] # length of prompt
+
+        for cur_pos in range(start_pos, start_pos+max_new_tokens):
+            logits = self._forward(input_ids[:,pre_pos:cur_pos], attention_mask[:,pre_pos:cur_pos], pre_pos)[:,-1,:]
             if temperature > 0:
                 probs = torch.softmax(logits.float() / temperature, dim=-1).type_as(logits)
                 next_token = sample_top_p(probs, top_p)
@@ -635,6 +452,8 @@ class Transformer(nn.Module):
                 dim=1,
             )
             generated_tokens.append(next_token)
+            pre_pos = cur_pos
+
         sequences = torch.concat(
             (input_ids, torch.stack(generated_tokens, dim=1)), dim=1
         )
@@ -643,7 +462,7 @@ class Transformer(nn.Module):
 
 def setup_model_parallel() -> Tuple[int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    world_size = int(os.environ.get("WORLD_SIZE", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     print("local_rank:", local_rank, "world_size:", world_size)
 
     torch.distributed.init_process_group("nccl")
@@ -663,7 +482,6 @@ def load_checkpoints(
         f"size is {world_size}"
     )
     ckpt_path = checkpoints[local_rank]
-    print("Loading")
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     with open(Path(ckpt_dir) / "params.json", "r") as f:
         params = json.loads(f.read())
@@ -684,13 +502,17 @@ def load_model(
 ) -> Tuple[Transformer, HFLikeTokenizer]:
     assert zero + tensor_parallel + pipeline_parallel <= 1, \
         "ZeRO, Tensor Parallel and Pipeline Parallel are mutually exclusive now"
+    print('Loading checkpoint from', ckpt_dir)
     checkpoint, params = load_checkpoints(ckpt_dir, local_rank, world_size)
     model_args: ModelArgs = ModelArgs(
         max_seq_len=max_seq_len, max_batch_size=max_batch_size, **params
     )
     model_args.froze_embeddings = froze_embeddings
     model_args.tensor_parallel = tensor_parallel
+
+    print('Loading tokenizer from', tokenizer_path)
     tokenizer = Tokenizer(model_path=tokenizer_path)
+
     model_args.vocab_size = tokenizer.n_words
     torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
     #torch.set_default_tensor_type(torch.cuda.HalfTensor)
