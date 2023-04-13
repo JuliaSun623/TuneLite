@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional
-from transformers import TrainingArguments, Seq2SeqTrainingArguments
+from tunelite.arguments import TuneLiteArguments
 
 @dataclass
 class ModelArguments:
@@ -12,7 +12,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_dir: str = field(default='data')
-    dataset_name: str = field(default='hellaswag')
+    dataset_name: str = field(default='openbookqa')
     refresh: bool = field(default=False, metadata={"help": "Whether to refresh the data."})
 
     data_tag: str = field(default='src')
@@ -23,9 +23,5 @@ class DataArguments:
 
 
 @dataclass
-class TuneLiteArguments(Seq2SeqTrainingArguments):
-    tag: str = field(default="debug", metadata={"help": "Tag for the experiment."})
-
-    max_new_tokens: int = field(default=100, metadata={"help": "The maximum numbers of tokens to generate, ignoring the number of tokens in the prompt."})
-    temperature: float = field(default=1.0, metadata={"help": "The value used to modulate the next token probabilities."})
-    top_p: float = field(default=1.0, metadata={"help": "If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to top_p or higher are kept for generation."})
+class MyTuneLiteArguments(TuneLiteArguments):
+    pass
